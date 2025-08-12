@@ -1,0 +1,663 @@
+import random
+import time
+import textwrap
+import os
+import json
+import pickle
+from datetime import date, timedelta
+
+# ==============================================================================
+# GAME CONSTANTS & CONFIGURATION
+# ==============================================================================
+STARTING_STAT_POINTS = 40
+MIN_STAT_VALUE = 5
+MAX_STAT_VALUE = 30
+INITIAL_SHIFT_TIME = 600 # 10 hours in minutes
+SAVE_FILE_NAME = "rookie_save.dat"
+CALL_DATA_FILE = "calls.json"
+
+# ==============================================================================
+# DATA LOADING
+# ==============================================================================
+def load_call_database():
+    """Loads the call database from an external JSON file."""
+    try:
+        with open(CALL_DATA_FILE, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"FATAL ERROR: {CALL_DATA_FILE} not found. Please make sure it's in the same directory.")
+        exit()
+    except json.JSONDecodeError:
+        print(f"FATAL ERROR: {CALL_DATA_FILE} is not a valid JSON file.")
+        exit()
+
+CALL_DATABASE = load_call_database()
+CRITICAL_CALL_TYPES = [
+    "Active Assailant / Active Shooter", "Officer Down / Officer Needs Help (Urgent)",
+    "Hostage Situation", "Kidnapping", "Bomb Threat", "Explosive Device / IED Found",
+    "Aircraft Down / Crash"
+]
+
+# ==============================================================================
+# GAME STATE AND DATA (GLOBAL)
+# ==============================================================================
+call_queue = []
+shift_time_remaining = INITIAL_SHIFT_TIME
+START_DATE = date(2025, 8, 1)
+call_id_counter = 1
+
+# ==============================================================================
+# CORE PLAYER CLASS
+# ==============================================================================
+class Officer:
+    """Represents the player character, holding all stats and inventory."""
+    def __init__(self):
+        # Core Stats
+        self.strength = 5
+        self.stamina = 5
+        self.perception = 5
+        self.de_escalation = 5
+        self.command_presence = 5
+        self.marksmanship = 5
+        self.law_knowledge = 5
+        
+        # Reputation & Progress
+        self.squad_reputation = 50
+        self.dispatch_reputation = 50
+        self.investigative_reputation = 10
+        self.fto_bonus = 30
+        self.active_leads = 0
+        
+        # Shift-based State
+        self.current_day = 1
+        self.unit_number = "N/A"
+        self.vehicle_issue = False
+        
+        # Inventory & Gear
+        self.inventory = {
+            'sidearm': {'name': 'Glock 19', 'maintained': False}
+        }
+
+    def get_stat(self, skill_key):
+        """Safely gets a stat value from the officer instance."""
+        return getattr(self, skill_key, 0)
+
+    def skill_check(self, skill_name):
+        """Performs a skill check against a D100 roll."""
+        skill_key = skill_name.lower().replace(" ", "_")
+        base_skill = self.get_stat(skill_key)
+        
+        if base_skill == 0:
+            print(f"DEBUG: SKILL {skill_key} NOT FOUND ON OFFICER")
+            return False
+
+        roll = random.randint(1, 100)
+        
+        # Calculate bonuses
+        maint_bonus = 0
+        if skill_key == "marksmanship" and self.inventory['sidearm']['maintained']:
+            maint_bonus = 5
+            
+        effective_skill = base_skill + self.fto_bonus + maint_bonus
+        
+        # Build the display string for the roll
+        roll_str = f"Rolling {skill_name}: {base_skill} (stat) + {self.fto_bonus} (FTO)"
+        if maint_bonus > 0:
+            roll_str += f" + {maint_bonus} (clean)"
+        roll_str += f" vs D100 roll of {roll}"
+        
+        print_text(roll_str, delay=0.2)
+        return roll <= effective_skill
+
+    def display_sheet(self):
+        """Prints the full character sheet."""
+        clear_screen(); print_header("Officer Sheet")
+        print("--- STATS ---")
+        print(f"{'Strength:':<25}{self.strength}")
+        print(f"{'Stamina:':<25}{self.stamina}")
+        print(f"{'Perception:':<25}{self.perception}")
+        print(f"{'De-escalation:':<25}{self.de_escalation}")
+        print(f"{'Command Presence:':<25}{self.command_presence}")
+        print(f"{'Marksmanship:':<25}{self.marksmanship}")
+        print(f"{'Law Knowledge:':<25}{self.law_knowledge}")
+        print("\n--- REPUTATION & PROGRESS ---")
+        print(f"{'Squad Reputation:':<25}{self.squad_reputation}")
+        print(f"{'Dispatch Reputation:':<25}{self.dispatch_reputation}")
+        print(f"{'Investigative Reputation:':<25}{self.investigative_reputation}")
+        print(f"{'FTO Training Bonus:':<25}{self.fto_bonus}")
+        print(f"{'Active Leads:':<25}{self.active_leads}")
+        print(f"\n--- CURRENT ASSIGNMENT ---")
+        print(f"{'Day:':<25}{self.current_day}")
+        print(f"{'Unit Number:':<25}{self.unit_number}")
+        print(f"{'Sidearm Maintained:':<25}{self.inventory['sidearm']['maintained']}")
+        input("\nPress Enter to return...")
+
+# ==============================================================================
+# UI & HELPER FUNCTIONS
+# ==============================================================================
+def clear_screen():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+def print_header(title):
+    print(f"\n{'='*40}\n {title.upper().center(38)} \n{'='*40}")
+
+def print_text(text, delay=0.5):
+    print(textwrap.fill(text, width=60))
+    time.sleep(delay)
+
+def get_input(prompt="> "):
+    try:
+        return input(prompt).strip().lower()
+    except EOFError:
+        return "quit"
+
+def print_menu(options):
+    for idx, opt in enumerate(options, 1):
+        print(f"{idx}. {opt}")
+
+def mobile_help():
+    clear_screen()
+    print_header("HELP & COMMANDS")
+    print_text("- take [call_id]: Respond to a call.")
+    print_text("- lookup [call_id]: Read call details.")
+    print_text("- proactive: Engage in proactive patrol.")
+    print_text("- sheet: View your officer and reputation.")
+    print_text("- help: View this help menu.")
+    print_text("- save: Save your progress.")
+    print_text("- quit: End your shift.")
+    input("\nPress Enter to return to duty...")
+
+# ==============================================================================
+# CHARACTER CREATION
+# ==============================================================================
+def display_creation_screen(officer, points):
+    clear_screen()
+    print_header("Create Officer")
+    print(f"Points to spend: {points}")
+    print(f"Stats start at {MIN_STAT_VALUE}, max {MAX_STAT_VALUE}.\n" + "-"*30)
+    stats_to_show = ["strength", "stamina", "perception", "de_escalation", "command_presence", "marksmanship", "law_knowledge"]
+    for stat in stats_to_show:
+        display_name = stat.replace("_", " ").title()
+        print(f"{display_name}: {officer.get_stat(stat)}")
+    print("-"*30)
+    print("Commands:")
+    print_menu([
+        "+ [stat] [amount]  (e.g. + strength 3)",
+        "- [stat] [amount]  (e.g. - stamina 2)",
+        "randomize          (auto-assign points)",
+        "done               (finish when points=0)"
+    ])
+
+def character_creation():
+    player_officer = Officer()
+    points = STARTING_STAT_POINTS
+    
+    stats_map = {
+        "strength": "strength", "stamina": "stamina", "perception": "perception",
+        "de-escalation": "de_escalation", "deescalation": "de_escalation",
+        "command presence": "command_presence", "command": "command_presence",
+        "marksmanship": "marksmanship", "shooting": "marksmanship",
+        "law knowledge": "law_knowledge", "law": "law_knowledge"
+    }
+    
+    while True:
+        display_creation_screen(player_officer, points)
+        if points == 0: print("\nType 'done' to begin your first shift.")
+        
+        choice = get_input()
+        if not choice: continue
+
+        parts = choice.split()
+        action = parts[0]
+
+        if action == "done" and points == 0:
+            break
+        elif action == "randomize":
+            # Reset stats before randomizing
+            for key in stats_map.values():
+                setattr(player_officer, key, MIN_STAT_VALUE)
+            
+            points_to_distribute = STARTING_STAT_POINTS
+            stat_keys = list(set(stats_map.values()))
+            while points_to_distribute > 0:
+                chosen_stat = random.choice(stat_keys)
+                if player_officer.get_stat(chosen_stat) < MAX_STAT_VALUE:
+                    setattr(player_officer, chosen_stat, player_officer.get_stat(chosen_stat) + 1)
+                    points_to_distribute -= 1
+            points = 0
+        elif action in ['+', '-']:
+            if len(parts) < 2:
+                print_text("Specify a stat.")
+                continue
+            
+            amount = 1
+            stat_parts = parts[1:]
+            if parts[-1].isdigit():
+                try:
+                    amount = int(parts[-1])
+                    stat_parts = parts[1:-1]
+                except ValueError:
+                    pass # Keep default amount
+            
+            stat_name_input = " ".join(stat_parts).lower()
+            stat_key = stats_map.get(stat_name_input)
+            
+            if not stat_key:
+                print_text(f"Invalid stat: {' '.join(stat_parts)}")
+                continue
+
+            current_val = player_officer.get_stat(stat_key)
+            if action == '+':
+                if points < amount:
+                    print_text(f"You only have {points} points.")
+                elif current_val + amount > MAX_STAT_VALUE:
+                    print_text(f"{stat_key.replace('_',' ').title()} can't go above {MAX_STAT_VALUE}.")
+                else:
+                    setattr(player_officer, stat_key, current_val + amount)
+                    points -= amount
+            elif action == '-':
+                if current_val - amount < MIN_STAT_VALUE:
+                    print_text(f"{stat_key.replace('_',' ').title()} can't drop below {MIN_STAT_VALUE}.")
+                else:
+                    setattr(player_officer, stat_key, current_val - amount)
+                    points += amount
+        else:
+            print_text("Invalid command.")
+            
+    print_header("Officer Created")
+    print_text("Welcome to the Department, rookie. Time to hit the streets!")
+    input("\nPress Enter to continue to Roll Call...")
+    return player_officer
+
+# ==============================================================================
+# SHIFT ROUTINES
+# ==============================================================================
+def pre_shift_routine(player_officer):
+    clear_screen(); print_header("Roll Call")
+    player_officer.vehicle_issue = False
+    player_officer.inventory['sidearm']['maintained'] = False # Reset maintenance each shift
+    
+    event = random.choice(["bolo", "chew_out", "policy_update", "quick_roll_call"])
+    player_officer.unit_number = f"1-ADAM-{random.randint(10, 99)}"
+    print_text(f"Sergeant: 'Alright listen up! Rookie, you're in {player_officer.unit_number} today.'")
+    if event == "bolo":
+        print_text("There's a BOLO out for a stolen blue sedan. Keep your eyes peeled.")
+    elif event == "chew_out":
+        print_text("The Sergeant chews out the whole squad for sloppy reports. Don't be the next reason for a lecture.")
+    else:
+        print_text("It's a quick, quiet roll call. The city is waiting.")
+    
+    input("\nPress Enter to prep your gear...")
+    clear_screen(); print_header("Gear Prep")
+    print_text(f"In the locker room, you check your duty belt. Your {player_officer.inventory['sidearm']['name']} feels a bit gritty from the last shift.")
+    print("Clean your weapon? (y/n)")
+    choice = get_input()
+    if choice == 'y':
+        player_officer.inventory['sidearm']['maintained'] = True
+        print_text("You take a few minutes to field strip and clean your weapon. It feels reliable in your hand. (+5 Marksmanship bonus this shift)")
+    else:
+        print_text("No time for that now. It'll probably be fine... right?")
+
+    input("\nPress Enter for vehicle inspection...")
+    clear_screen(); print_header("Vehicle Inspection")
+    print_text("You walk around your assigned unit, giving it a once-over.")
+    if not player_officer.skill_check("Perception"):
+        print_text("Looks fine. What could possibly go wrong?")
+        if random.randint(1, 4) == 1:
+            player_officer.vehicle_issue = True
+            print_text("You missed the slow leak in the front-right tire. That's gonna be a problem later.", 0)
+    else:
+        print_text("You spot a new scuff on the rear bumper that wasn't on the log. You note it down, saving yourself a headache with the motor pool sergeant.")
+        player_officer.squad_reputation += 1
+    
+    print_text("You log into the vehicle's computer. You're 10-8, in service.")
+    input("\nPress Enter to start your shift...")
+
+def end_of_shift_summary(player_officer, old_rep):
+    clear_screen(); print_header("End of Shift")
+    print_text("Back at the station, you log off the computer, the adrenaline finally fading.")
+    
+    print("\n--- REPUTATION CHANGES ---")
+    squad_change = player_officer.squad_reputation - old_rep['squad']
+    dispatch_change = player_officer.dispatch_reputation - old_rep['dispatch']
+    investigative_change = player_officer.investigative_reputation - old_rep['investigative']
+    print(f"Squad Rep: {player_officer.squad_reputation} ({squad_change:+})")
+    print(f"Dispatch Rep: {player_officer.dispatch_reputation} ({dispatch_change:+})")
+    print(f"Investigative Rep: {player_officer.investigative_reputation} ({investigative_change:+})")
+    print("--------------------\n")
+    
+    if squad_change > 3:
+        print_text("The squad seems impressed with your work today. You get a few appreciative nods.")
+    elif squad_change < -3:
+        print_text("You hear some grumbling from the senior guys in the locker room. You're on their shit list.")
+    
+    if player_officer.fto_bonus > 0:
+        player_officer.fto_bonus -= 1
+        print_text(f"Your FTO seems a little more hands-off. Your training bonus is now {player_officer.fto_bonus}.")
+
+    player_officer.current_day += 1
+    
+    print("\nDo you want to save your progress? (y/n)")
+    if get_input() == 'y':
+        save_game(player_officer)
+
+# ==============================================================================
+# MISSION & ACTION HANDLERS
+# ==============================================================================
+def display_call_slip(call):
+    clear_screen()
+    print_header(f"CALL SLIP: {call['type']}")
+    print_text(f"ID: {call['id']}\nPRIORITY: {call['priority']}\nADDRESS: {call['address']}\nSUMMARY: {call['summary']}")
+    input("\nPress Enter to proceed...")
+
+def end_call(player_officer, message, **kwargs):
+    clear_screen(); print_header("Call Concluded")
+    print_text(message)
+    for rep_key, change in kwargs.items():
+        if hasattr(player_officer, rep_key):
+            current_val = getattr(player_officer, rep_key)
+            setattr(player_officer, rep_key, current_val + change)
+            print_text(f"{rep_key.replace('_', ' ').title()} changed by {change:+}")
+    input("\nPress Enter to return to service...")
+
+def clear_call_menu(player_officer, outcomes):
+    global shift_time_remaining
+    while True:
+        clear_screen(); print_header("Clear Call")
+        for i, outcome in enumerate(outcomes):
+            print(f"{i+1}: {outcome['desc']} ({outcome['time_cost']} mins)")
+        print(f"{len(outcomes)+1}: Ride the call... (90 mins)")
+        
+        choice = get_input()
+        if choice == "help":
+            mobile_help()
+            continue
+
+        if choice.isdigit() and 1 <= int(choice) <= len(outcomes) + 1:
+            if int(choice) - 1 < len(outcomes):
+                selected = outcomes[int(choice) - 1]
+                shift_time_remaining -= selected['time_cost']
+                end_call(player_officer, selected['message'], **selected.get('rep_changes', {}))
+            else:
+                shift_time_remaining -= 90
+                end_call(player_officer, "You take extra time on the report, burning the clock. The squad won't like that.", squad_reputation=-3, dispatch_reputation=-2)
+            return # Exit the function after a valid choice
+        else:
+            print_text("Invalid choice, try again.")
+
+def handle_generic_call(player_officer, call):
+    display_call_slip(call)
+    print_text("You arrive and assess the scene.")
+    
+    # Check for unfounded call
+    if random.randint(1, 10) == 1:
+        print_text(f"Arrived: Unfounded. The reporting party was mistaken. {call['unfounded']}")
+        clear_call_menu(player_officer, [{"desc": "Clear as unfounded.", "time_cost": 15, "message": "Good, quick clear. Dispatch appreciates the turnaround.", "rep_changes": {"dispatch_reputation": 1}}])
+        return
+
+    while True:
+        clear_screen()
+        print_header(f"ON SCENE: {call['type']}")
+        print_text(f"ADDRESS: {call['address']}\nSUMMARY: {call['summary']}\n")
+        print_menu(["Investigate scene (Perception)", "Talk to involved parties (De-escalation)", "Take command (Command Presence)"])
+        choice = get_input()
+
+        if choice == "help":
+            mobile_help()
+            continue
+        
+        action_taken = False
+        if choice == '1':
+            action_taken = True
+            if player_officer.skill_check("Perception"):
+                print_text("You notice something out of place... something critical.")
+                if random.randint(1, 4) == 1:
+                    print_text(f"Turns out it was just a misunderstanding: {call['unfounded']}.")
+                    clear_call_menu(player_officer, [{"desc": "Report as unfounded.", "time_cost": 20, "message": "Good work sussing out a bogus call.", "rep_changes": {"dispatch_reputation": 2, "investigative_reputation": 1}}])
+                else:
+                    print_text(f"The situation is not what it seems. The hidden detail: {call['twist']}")
+                    player_officer.active_leads += 1
+                    print_text("You've uncovered a new lead! (+1 Active Lead)", 0.2)
+                    clear_call_menu(player_officer, [{"desc": "Make arrest/file detailed report.", "time_cost": 60, "message": "Successful resolution based on your sharp eyes. Solid report.", "rep_changes": {"investigative_reputation": 3, "squad_reputation": 1}}])
+            else:
+                print_text("You scan the scene, but nothing seems out of the ordinary. Looks like a routine report.")
+                clear_call_menu(player_officer, [{"desc": "File routine report.", "time_cost": 25, "message": "You handled it as a standard call.", "rep_changes": {"dispatch_reputation": 1}}])
+        elif choice == '2':
+            action_taken = True
+            if player_officer.skill_check("De-escalation"):
+                print_text("You talk to everyone, and your calm, reasonable tone brings the tension down.")
+                clear_call_menu(player_officer, [{"desc": "De-escalate and clear.", "time_cost": 30, "message": "You resolved the situation without incident. Textbook.", "rep_changes": {"dispatch_reputation": 1, "squad_reputation": 1}}])
+            else:
+                print_text("You try to talk to people, but your words only seem to make things worse. The tension increases.")
+                clear_call_menu(player_officer, [{"desc": "Back off and let things cool down.", "time_cost": 20, "message": "The situation fizzles out, but you looked ineffective.", "rep_changes": {"squad_reputation": -1}}])
+        elif choice == '3':
+            action_taken = True
+            if player_officer.skill_check("Command Presence"):
+                print_text("You take charge of the scene with unshakeable authority. Everyone quiets down and listens to you.")
+                clear_call_menu(player_officer, [{"desc": "Take control and clear.", "time_cost": 25, "message": "A swift, textbook resolution. You looked like a veteran.", "rep_changes": {"squad_reputation": 2}}])
+            else:
+                print_text("You try to take command, but they see the rookie in your eyes and ignore you.")
+                clear_call_menu(player_officer, [{"desc": "Call for a supervisor.", "time_cost": 45, "message": "Having to call a Sergeant to handle your scene is not a good look.", "rep_changes": {"squad_reputation": -3, "dispatch_reputation": -1}}])
+        
+        if action_taken:
+            break # Exit loop after action
+        else: # Invalid or no choice
+            print_text("You hesitate, unsure of the right approach. The situation resolves itself without your input.")
+            clear_call_menu(player_officer, [{"desc": "Clear the call.", "time_cost": 15, "message": "You took no significant action. The call is cleared.", "rep_changes": {"squad_reputation": -1}}])
+            break
+
+
+def handle_proactive_patrol(player_officer):
+    global shift_time_remaining
+    print_text("You decide to go hunting for trouble instead of waiting for it...")
+    shift_time_remaining -= 45
+    event_roll = random.randint(1, 10)
+    
+    if event_roll <= 3:
+        end_call(player_officer, "The city is quiet. You spend an hour on patrol finding nothing but peace.")
+    elif event_roll <= 6:
+        print_text("You spot a suspicious car parked in a dark alley.")
+        if player_officer.skill_check("Law Knowledge"):
+            end_call(player_officer, "You run the plates and they come back as stolen. You found the BOLO vehicle! Great recovery.", investigative_reputation=3, dispatch_reputation=1)
+        else:
+            end_call(player_officer, "You try to run the plate, but you botch the number. The car drives off before you can correct it. Damn.", investigative_reputation=-1)
+    elif event_roll <= 9:
+        print_text("You spot what looks like a hand-to-hand drug deal on a street corner.")
+        if player_officer.skill_check("Strength"):
+            player_officer.active_leads += 1
+            end_call(player_officer, "You jump out and give chase, catching the dealer after a short foot pursuit! Great bust and a new lead.", investigative_reputation=5, squad_reputation=1)
+        else:
+            end_call(player_officer, "The dealer is too fast. He disappears into a maze of backyards. You lost him.", investigative_reputation=-2, squad_reputation=-1)
+    else:
+        print_text("A car blows past you at 90mph. You get behind it and light it up, but the occupants start shooting back! It's a gunfight!")
+        if not player_officer.inventory['sidearm']['maintained'] and random.randint(1, 4) == 1:
+            end_call(player_officer, "You draw your weapon and pull the trigger... *CLICK*. A stovepipe jam! By the time you clear it, the car is gone. Fucking hell!", investigative_reputation=-5, squad_reputation=-4)
+        elif player_officer.skill_check("Marksmanship"):
+            end_call(player_officer, "You return fire accurately, and the threat is neutralized. You just won a gunfight. You're a hero!", investigative_reputation=15, squad_reputation=5)
+        else:
+            end_call(player_officer, "Your shots go wide in the heat of the moment. The suspects manage to escape. IA is gonna have a field day with this.", investigative_reputation=-5, squad_reputation=-3)
+
+def handle_critical_incident(player_officer):
+    global shift_time_remaining
+    call_type = random.choice(CRITICAL_CALL_TYPES)
+    clear_screen(); print_header(f"!!! CRITICAL INCIDENT - {call_type.upper()} !!!")
+    print_text("The radio goes silent except for the dispatcher's urgent tone.")
+    print_text(f"\"All units, stand by... {player_officer.unit_number}, you're the closest unit to an active incident. Respond CODE 3!\"")
+    time_cost = random.randint(150, 240)
+    shift_time_remaining -= time_cost
+    input("\nPress Enter to hit the lights and siren...")
+    print_text("The next few hours are a blur of adrenaline, chaos, and training taking over. Eventually, the scene is secured.")
+    
+    if call_type == "Officer Down / Officer Needs Help (Urgent)":
+        end_call(player_officer, "You were the first one there and pulled a fellow officer out of an ambush. You're a goddamn hero.", squad_reputation=15, investigative_reputation=5)
+    else:
+        end_call(player_officer, "You performed your duties admirably in a critical situation. You've earned some serious respect.", squad_reputation=5, investigative_reputation=10)
+
+def check_for_random_events(player_officer):
+    global shift_time_remaining
+    if player_officer.vehicle_issue and random.randint(1, 30) == 1:
+        print_header("!!! MECHANICAL FAILURE !!!")
+        print_text("That tire you missed finally gives out. You have a blowout on the freeway, causing a major delay while you wait for a tow.")
+        shift_time_remaining -= 60
+        player_officer.squad_reputation -= 2
+        player_officer.vehicle_issue = False
+        input("\nPress Enter to continue after the delay...")
+        return True
+    return False
+
+# ==============================================================================
+# SAVE & LOAD SYSTEM
+# ==============================================================================
+def save_game(player_officer):
+    try:
+        with open(SAVE_FILE_NAME, 'wb') as f:
+            pickle.dump(player_officer, f)
+        print_text("Progress saved.", delay=0.2)
+    except Exception as e:
+        print_text(f"Error saving game: {e}", delay=0.2)
+
+def load_game():
+    if os.path.exists(SAVE_FILE_NAME):
+        try:
+            with open(SAVE_FILE_NAME, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            print_text(f"Error loading save file: {e}. Starting a new game.")
+            return None
+    return None
+
+# ==============================================================================
+# MAIN GAME LOGIC
+# ==============================================================================
+def generate_calls():
+    global call_queue, call_id_counter
+    if not call_queue:
+        num_calls = random.randint(6, 10)
+        all_call_types = list(CALL_DATABASE.keys())
+        high_priority_call_types = ["Assault In Progress", "Robbery/Burglary In Progress", "Shooting/Stabbing","Violent Domestic", "Carjacking In Progress"]
+        for _ in range(num_calls):
+            priority_roll = random.randint(1, 8)
+            if priority_roll == 1:
+                call_type = random.choice(high_priority_call_types)
+                priority = "HIGH"
+            else:
+                call_type = random.choice(all_call_types)
+                priority = random.randint(1, 5)
+            call_details = random.choice(CALL_DATABASE[call_type])
+            new_call = {
+                'id': call_id_counter, 'type': call_type, 'priority': priority,
+                'address': f"{random.randint(100, 9999)} {random.choice(['Main St', 'Oak Ave', 'Pine Ln', 'Maple Ct', 'Park Blvd', 'Cedar St'])}",
+                'summary': call_details['summary'], 'twist': call_details['twist'], 'unfounded': call_details['unfounded']
+            }
+            call_queue.append(new_call)
+            call_id_counter += 1
+        
+        # Efficiently sort calls by priority
+        def sort_key(call):
+            p = call['priority']
+            if p == "HIGH": return (0, 0)
+            return (1, p)
+        call_queue.sort(key=sort_key)
+
+def start_new_shift(player_officer):
+    global shift_time_remaining
+    shift_time_remaining = INITIAL_SHIFT_TIME
+    pre_shift_routine(player_officer)
+    generate_calls()
+
+def main():
+    global shift_time_remaining
+    
+    clear_screen()
+    print_header("ROOKIE: The First Ten Hours")
+    print_text("A gritty, realistic, text-based police RPG.", delay=0.2)
+    
+    player_officer = None
+    print("1. Start New Game")
+    print("2. Load Saved Game")
+    choice = get_input()
+    
+    if choice == '2':
+        player_officer = load_game()
+        if player_officer:
+            print_text("Save file loaded successfully!")
+        else:
+            print_text("No save file found or file was corrupt. Starting a new game...")
+            player_officer = character_creation()
+    else:
+        player_officer = character_creation()
+        save_game(player_officer) # Initial save
+
+    # Main game loop for playing multiple shifts
+    while True:
+        start_new_shift(player_officer)
+        old_rep = {
+            'squad': player_officer.squad_reputation,
+            'dispatch': player_officer.dispatch_reputation,
+            'investigative': player_officer.investigative_reputation
+        }
+
+        # Loop for a single shift
+        while shift_time_remaining > 0:
+            generate_calls()
+            if check_for_random_events(player_officer): continue
+            if random.randint(1, 40) == 1:
+                handle_critical_incident(player_officer)
+                continue
+            
+            clear_screen()
+            hours, minutes = divmod(shift_time_remaining, 60)
+            current_date = START_DATE + timedelta(days=player_officer.current_day - 1)
+            date_str = current_date.strftime("%A, %B %d, %Y")
+            print_header(f"ON DUTY - UNIT {player_officer.unit_number} - {date_str}")
+            print(f"Time Left: {hours:02d}h {minutes:02d}m".center(40))
+            print("--- CAD: ACTIVE CALLS ---")
+
+            for call in call_queue:
+                print(f"ID: {call['id']:<3} | PRI: {str(call['priority']):<5} | TYPE: {call['type']:<26}")
+            print("--------------------------------")
+            print("Commands: take [id], lookup [id], proactive, sheet, save, help, quit")
+            
+            choice_input = get_input().split()
+            if not choice_input: continue
+            
+            action = choice_input[0]
+            
+            if action == "help":
+                mobile_help()
+            elif action == "save":
+                save_game(player_officer)
+            elif action == "sheet":
+                player_officer.display_sheet()
+            elif action == "quit":
+                shift_time_remaining = 0
+            elif action == "proactive":
+                handle_proactive_patrol(player_officer)
+            elif action in ["take", "lookup"]:
+                if len(choice_input) < 2 or not choice_input[1].isdigit():
+                    print_text("Specify a valid call ID.")
+                    continue
+                call_id = int(choice_input[1])
+                call_to_handle = next((c for c in call_queue if c['id'] == call_id), None)
+                
+                if not call_to_handle:
+                    print_text("That Call ID is not in the queue.")
+                    continue
+
+                if action == "take":
+                    call_queue = [c for c in call_queue if c['id'] != call_id]
+                    handle_generic_call(player_officer, call_to_handle)
+                elif action == "lookup":
+                    display_call_slip(call_to_handle)
+            else:
+                print_text("Invalid command.")
+        
+        # End of shift
+        end_of_shift_summary(player_officer, old_rep)
+        print("\nReady to start your next shift? (y/n)")
+        if get_input() != 'y':
+            print_text("Thanks for playing! Stay safe out there.")
+            break
+
+if __name__ == "__main__":
+    main()
